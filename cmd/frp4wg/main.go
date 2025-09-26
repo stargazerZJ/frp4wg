@@ -166,6 +166,13 @@ type clientManager struct {
 }
 
 func runClient(cfg clientConfig) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	return runClientWithContext(ctx, cfg)
+}
+
+// runClientWithContext is the same as runClient but accepts a parent context for tests.
+func runClientWithContext(ctx context.Context, cfg clientConfig) error {
 	logger := cfg.Logger
 	serverAddr, err := net.ResolveUDPAddr("udp", cfg.Server)
 	if err != nil {
@@ -175,8 +182,6 @@ func runClient(cfg clientConfig) error {
 	if err != nil {
 		return fmt.Errorf("resolve local wg: %w", err)
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	m := &clientManager{
 		cfg:        cfg,
@@ -210,7 +215,7 @@ func runClient(cfg clientConfig) error {
 		}
 	}()
 
-	// Wait for signal
+	// Wait for signal or parent cancel
 	<-m.ctx.Done()
 	logger.Info("client stopping...")
 	m.shutdown()
@@ -289,15 +294,18 @@ func (m *clientManager) shutdown() {
 }
 
 type clientStandby struct {
-	m      *clientManager
-	conn   *net.UDPConn
-	key    string
-	logger *slog.Logger
+	m        *clientManager
+	conn     *net.UDPConn
+	key      string
+	logger   *slog.Logger
+	promoted bool
 }
 
 func (s *clientStandby) run() {
 	defer func() {
-		_ = s.conn.Close()
+		if !s.promoted {
+			_ = s.conn.Close()
+		}
 		s.m.removeStandby(s)
 	}()
 
@@ -364,9 +372,16 @@ func (s *clientStandby) run() {
 			continue
 		}
 
-		// Received non-handshake from server: activate immediately (0-RTT)
+		// Received non-handshake from server: forward it to local WG immediately, then promote (0-RTT)
+		if _, werr := s.conn.WriteToUDP(data, s.m.localAddr); werr != nil {
+			logger.Warn("forward first packet to local wg failed", "err", werr)
+			// Still promote so subsequent packets can be relayed
+		} else {
+			logger.Debug("forwarded first packet to local wg")
+		}
 		logger.Info("activation signal received, promoting to active")
 		// Important: do not close s.conn; promote uses the same socket
+		s.promoted = true
 		s.m.promoteToActive(s)
 		return
 	}
@@ -390,108 +405,66 @@ func (a *clientActive) run() {
 	logger := a.logger.With("server", a.serverAddr.String(), "localWG", a.localWGAddr.String())
 	logger.Info("active start")
 
-	// local connection to WireGuard
-	localConn, err := net.DialUDP("udp", nil, a.localWGAddr)
-	if err != nil {
-		logger.Error("dial local wireguard failed", "err", err)
-		return
-	}
-	defer localConn.Close()
-
+	// Use the same UDP socket (a.conn) to forward both directions in a single goroutine.
+	// This ensures the very first datagram (WireGuard handshake) was already forwarded
+	// during promotion, and subsequent packets will flow bidirectionally through the same port.
 	if a.bufSize > 0 {
 		_ = a.conn.SetReadBuffer(a.bufSize)
 		_ = a.conn.SetWriteBuffer(a.bufSize)
-		_ = localConn.SetReadBuffer(a.bufSize)
-		_ = localConn.SetWriteBuffer(a.bufSize)
 	}
 
-	var (
-		lastActiveMu sync.Mutex
-		lastActive   = time.Now()
-		updateActive = func() {
-			lastActiveMu.Lock()
+	lastActive := time.Now()
+	buf := make([]byte, max(2048, a.bufSize))
+
+	for {
+		_ = a.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, from, err := a.conn.ReadFromUDP(buf)
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) || isTimeout(err) {
+				// idle/stop checks
+				select {
+				case <-a.m.ctx.Done():
+					logger.Info("active stop")
+					return
+				default:
+				}
+				if a.idle > 0 && time.Since(lastActive) >= a.idle {
+					logger.Info("active idle timeout")
+					return
+				}
+				continue
+			}
+			logger.Warn("active read error", "err", err)
+			return
+		}
+
+		data := buf[:n]
+		// drop control handshake packets in active mode
+		if isHandshake(data) {
+			continue
+		}
+		// Direction: server -> local WireGuard
+		if from.IP.Equal(a.serverAddr.IP) && from.Port == a.serverAddr.Port {
+			if _, werr := a.conn.WriteToUDP(data, a.localWGAddr); werr != nil {
+				logger.Warn("forward to local wg failed", "err", werr)
+				return
+			}
 			lastActive = time.Now()
-			lastActiveMu.Unlock()
+			continue
 		}
-		isIdle = func() bool {
-			lastActiveMu.Lock()
-			defer lastActiveMu.Unlock()
-			return time.Since(lastActive) >= a.idle
-		}
-	)
 
-	ctx, cancel := context.WithCancel(a.m.ctx)
-	defer cancel()
-
-	// server -> local WG
-	go func() {
-		buf := make([]byte, max(2048, a.bufSize))
-		for {
-			_ = a.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, from, err := a.conn.ReadFromUDP(buf)
-			if err != nil {
-				if errors.Is(err, os.ErrDeadlineExceeded) || isTimeout(err) {
-					if ctx.Err() != nil {
-						return
-					}
-					if a.idle > 0 && isIdle() {
-						cancel()
-						return
-					}
-					continue
-				}
-				cancel()
+		// Direction: local WireGuard -> server
+		if from.IP.Equal(a.localWGAddr.IP) && from.Port == a.localWGAddr.Port {
+			if _, werr := a.conn.WriteToUDP(data, a.serverAddr); werr != nil {
+				logger.Warn("forward to server failed", "err", werr)
 				return
 			}
-			// only accept from server
-			if !from.IP.Equal(a.serverAddr.IP) || from.Port != a.serverAddr.Port {
-				continue
-			}
-			data := buf[:n]
-			// drop handshakes in active mode
-			if isHandshake(data) {
-				continue
-			}
-			if _, err := localConn.Write(data); err != nil {
-				cancel()
-				return
-			}
-			updateActive()
+			lastActive = time.Now()
+			continue
 		}
-	}()
 
-	// local WG -> server
-	go func() {
-		buf := make([]byte, max(2048, a.bufSize))
-		for {
-			_ = localConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, err := localConn.Read(buf)
-			if err != nil {
-				if errors.Is(err, os.ErrDeadlineExceeded) || isTimeout(err) {
-					if ctx.Err() != nil {
-						return
-					}
-					if a.idle > 0 && isIdle() {
-						cancel()
-						return
-					}
-					continue
-				}
-				cancel()
-				return
-			}
-			data := buf[:n]
-			if _, err := a.conn.WriteToUDP(data, a.serverAddr); err != nil {
-				cancel()
-				return
-			}
-			updateActive()
-		}
-	}()
-
-	// wait for cancel or context done
-	<-ctx.Done()
-	logger.Info("active stop")
+		// Unknown source: ignore
+	}
 }
 
 // ---------- server implementation
@@ -549,6 +522,13 @@ type serverState struct {
 }
 
 func runServer(cfg serverConfig) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	return runServerWithContext(ctx, cfg)
+}
+
+// runServerWithContext is the same as runServer but accepts a parent context for tests.
+func runServerWithContext(ctx context.Context, cfg serverConfig) error {
 	bindAddr, err := net.ResolveUDPAddr("udp", cfg.Bind)
 	if err != nil {
 		return fmt.Errorf("resolve bind: %w", err)
@@ -563,9 +543,6 @@ func runServer(cfg serverConfig) error {
 		_ = conn.SetWriteBuffer(cfg.ReadBufferSize)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-
 	s := &serverState{
 		cfg:            cfg,
 		conn:           conn,
@@ -576,7 +553,7 @@ func runServer(cfg serverConfig) error {
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
-	cfg.Logger.Info("server start", "bind", bindAddr.String())
+	cfg.Logger.Info("server start", "bind", conn.LocalAddr().String())
 
 	// GC worker
 	s.wg.Add(1)
@@ -647,8 +624,6 @@ func runServer(cfg serverConfig) error {
 		// Forward the very first datagram immediately (0-RTT)
 		_, _ = conn.WriteToUDP(data, client)
 	}
-
-	// unreachable
 }
 
 func (s *serverState) routeIfActive(src *net.UDPAddr, data []byte) bool {
