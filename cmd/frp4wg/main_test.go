@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -19,6 +21,24 @@ func readFromUDP(t *testing.T, c *net.UDPConn, d time.Duration) (int, *net.UDPAd
 	}
 	return n, src, buf[:n]
 }
+
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func strconvIt(i int) string {
+	return strconv.Itoa(i)
+}
+
+// ---- Client-side test: first packet is forwarded before promotion, then bridge via single socket
 
 func TestClient_ForwardFirstPacketAndBridgeSingleSocket(t *testing.T) {
 	// Start fake "server" and "local WireGuard" UDP listeners on loopback.
@@ -40,8 +60,8 @@ func TestClient_ForwardFirstPacketAndBridgeSingleSocket(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cfg := clientConfig{
-		Server:            net.JoinHostPort(serverAddr.IP.String(), func() string { return strconvIt(serverAddr.Port) }()),
-		LocalWG:           net.JoinHostPort(wgAddr.IP.String(), func() string { return strconvIt(wgAddr.Port) }()),
+		Server:            net.JoinHostPort(serverAddr.IP.String(), strconvIt(serverAddr.Port)),
+		LocalWG:           net.JoinHostPort(wgAddr.IP.String(), strconvIt(wgAddr.Port)),
 		StandbyN:          1,
 		HandshakeInterval: 100 * time.Millisecond,
 		HandshakeTries:    10,
@@ -136,18 +156,362 @@ func TestClient_ForwardFirstPacketAndBridgeSingleSocket(t *testing.T) {
 	}
 }
 
-func equalBytes(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
+// ---- Server-side unit test: standby, activation, and bidirectional routing
+
+func TestServer_StandbyActivation_RoutesBothWays(t *testing.T) {
+	// Reserve a free UDP port for server
+	tmp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+	port := tmp.LocalAddr().(*net.UDPAddr).Port
+	_ = tmp.Close()
+
+	serverBind := fmt.Sprintf("127.0.0.1:%d", port)
+	serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cfg := serverConfig{
+		Bind:           serverBind,
+		StandbyTTL:     5 * time.Second,
+		ActiveIdle:     10 * time.Second,
+		MaxStandby:     64,
+		GCInterval:     500 * time.Millisecond,
+		ReadBufferSize: 65535,
+		Logger:         newLogger(),
+	}
+	doneSrv := make(chan struct{})
+	go func() {
+		defer close(doneSrv)
+		_ = runServerWithContext(ctx, cfg)
+	}()
+
+	// Client socket that will become the "client" side of the mapping.
+	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientConn.Close()
+
+	// 1) Client sends handshake to server, receives handshake reply (retry until server is ready)
+	handshakeDeadline := time.Now().Add(2 * time.Second)
+	var from *net.UDPAddr
+	var data []byte
+	for {
+		if _, err := clientConn.WriteToUDP(magicBytes, serverAddr); err != nil {
+			t.Fatalf("client send handshake: %v", err)
+		}
+		_ = clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		buf := make([]byte, 65535)
+		n, f, err := clientConn.ReadFromUDP(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if time.Now().After(handshakeDeadline) {
+					t.Fatalf("timeout waiting for handshake reply")
+				}
+				continue
+			}
+			t.Fatalf("client read handshake reply: %v", err)
+		}
+		from = f
+		data = buf[:n]
+		if string(data) == handshakeMagic {
+			break
+		}
+		if time.Now().After(handshakeDeadline) {
+			t.Fatalf("timeout without receiving proper handshake reply, got %x", data)
 		}
 	}
-	return true
+	if from.Port != serverAddr.Port || !from.IP.Equal(serverAddr.IP) {
+		t.Fatalf("handshake reply from unexpected addr: %v", from)
+	}
+
+	// 2) Remote sends first packet to server; server should consume standby and forward to client
+	remoteConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("remote listen: %v", err)
+	}
+	defer remoteConn.Close()
+
+	first := []byte("wg-init")
+	if _, err := remoteConn.WriteToUDP(first, serverAddr); err != nil {
+		t.Fatalf("remote send first: %v", err)
+	}
+	_, _, gotFirstAtClient := readFromUDP(t, clientConn, 2*time.Second)
+	if !equalBytes(gotFirstAtClient, first) {
+		t.Fatalf("client did not receive first forwarded packet, got %x want %x", gotFirstAtClient, first)
+	}
+
+	// 3) Client -> Server should be routed to remote
+	fromClient := []byte("from-client")
+	if _, err := clientConn.WriteToUDP(fromClient, serverAddr); err != nil {
+		t.Fatalf("client send: %v", err)
+	}
+	_, _, gotAtRemote := readFromUDP(t, remoteConn, 2*time.Second)
+	if !equalBytes(gotAtRemote, fromClient) {
+		t.Fatalf("remote got mismatch: %x want %x", gotAtRemote, fromClient)
+	}
+
+	// Cleanup
+	cancel()
+	select {
+	case <-doneSrv:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("server did not exit in time")
+	}
 }
 
-func strconvIt(i int) string {
-	return strconv.Itoa(i)
+// ---- E2E test with a few concurrent connections
+
+func TestE2E_ConcurrentClients(t *testing.T) {
+	// Reserve server port
+	tmp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	port := tmp.LocalAddr().(*net.UDPAddr).Port
+	_ = tmp.Close()
+	serverBind := fmt.Sprintf("127.0.0.1:%d", port)
+	serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
+
+	// Start server
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	srvCfg := serverConfig{
+		Bind:           serverBind,
+		StandbyTTL:     10 * time.Second,
+		ActiveIdle:     10 * time.Second,
+		MaxStandby:     256,
+		GCInterval:     1 * time.Second,
+		ReadBufferSize: 65535,
+		Logger:         newLogger(),
+	}
+	doneSrv := make(chan struct{})
+	go func() {
+		defer close(doneSrv)
+		_ = runServerWithContext(ctx, srvCfg)
+	}()
+
+	type clientCtx struct {
+		wgConn         *net.UDPConn // local wireguard listener
+		wgAddr         *net.UDPAddr
+		clientSockSeen *net.UDPAddr // ephemeral addr observed at wgConn (client's a.conn)
+		cancel         context.CancelFunc
+		done           chan struct{}
+	}
+
+	N := 3
+	cc := make([]*clientCtx, 0, N)
+
+	// Start N clients
+	for i := 0; i < N; i++ {
+		wgConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if err != nil {
+			t.Fatalf("wg listen %d: %v", i, err)
+		}
+		wgAddr := wgConn.LocalAddr().(*net.UDPAddr)
+
+		cctx, ccancel := context.WithCancel(ctx)
+		cfg := clientConfig{
+			Server:            serverBind,
+			LocalWG:           net.JoinHostPort(wgAddr.IP.String(), strconvIt(wgAddr.Port)),
+			StandbyN:          2,
+			HandshakeInterval: 100 * time.Millisecond,
+			HandshakeTries:    10,
+			ActiveIdle:        10 * time.Second,
+			ReadBufferSize:    65535,
+			Logger:            newLogger(),
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = runClientWithContext(cctx, cfg)
+		}()
+		cc = append(cc, &clientCtx{wgConn: wgConn, wgAddr: wgAddr, cancel: ccancel, done: done})
+	}
+
+	// For each client, activate by sending from a unique remote
+	type remoteCtx struct {
+		conn *net.UDPConn
+		addr *net.UDPAddr
+	}
+	remotes := make([]*remoteCtx, 0, N)
+	for i := 0; i < N; i++ {
+		rc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if err != nil {
+			t.Fatalf("remote %d listen: %v", i, err)
+		}
+		remotes = append(remotes, &remoteCtx{conn: rc, addr: rc.LocalAddr().(*net.UDPAddr)})
+	}
+
+	// Discover mapping between each remote and whichever client the server pairs it with.
+	// Each remote i sends a unique first payload: 0x99, i, 0x01. We read from all client wgConns
+	// until each remote is matched to some client.
+	remoteToClient := make([]int, N)
+	for i := range remoteToClient {
+		remoteToClient[i] = -1
+	}
+	// inverse mapping: client index -> remote index
+	clientToRemote := make([]int, N)
+	for i := range clientToRemote {
+		clientToRemote[i] = -1
+	}
+	firstPkts := make([][]byte, N)
+	for i := 0; i < N; i++ {
+		firstPkts[i] = []byte{0x99, byte(i), 0x01}
+	}
+	discoveryDeadline := time.Now().Add(7 * time.Second)
+	buf := make([]byte, 65535)
+	assigned := 0
+	for assigned < N {
+		// Send one first packet from each unmapped remote
+		for i := 0; i < N; i++ {
+			if remoteToClient[i] == -1 {
+				if _, err := remotes[i].conn.WriteToUDP(firstPkts[i], serverAddr); err != nil {
+					t.Fatalf("remote %d send first: %v", i, err)
+				}
+			}
+		}
+		// Probe all client wgConns for short window
+		progress := false
+		for j := 0; j < N; j++ {
+			_ = cc[j].wgConn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+			n, from, err := cc[j].wgConn.ReadFromUDP(buf)
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				t.Fatalf("client %d wg read error: %v", j, err)
+			}
+			d := append([]byte(nil), buf[:n]...)
+			// Identify remote index by payload signature
+			if len(d) >= 3 && d[0] == 0x99 && d[2] == 0x01 {
+				idx := int(d[1])
+				if idx >= 0 && idx < N && remoteToClient[idx] == -1 {
+					remoteToClient[idx] = j
+					clientToRemote[j] = idx
+					cc[j].clientSockSeen = from
+					progress = true
+					assigned++
+				}
+			}
+		}
+		if assigned >= N {
+			break
+		}
+		if !progress && time.Now().After(discoveryDeadline) {
+			t.Fatalf("mapping discovery timed out; assigned=%d/%d", assigned, N)
+		}
+	}
+
+	// Now concurrently exercise both directions for all mappings
+	var wg sync.WaitGroup
+	wg.Add(2 * N)
+
+	// remote -> wg
+	for i := 0; i < N; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			msg := []byte("hello-" + strconvIt(i))
+			c := remoteToClient[i]
+			if c < 0 || c >= N {
+				t.Fatalf("invalid mapping for remote %d -> client %d", i, c)
+			}
+			if _, err := remotes[i].conn.WriteToUDP(msg, serverAddr); err != nil {
+				t.Fatalf("remote %d write: %v", i, err)
+			}
+			// Read until expected msg (other traffic may interleave)
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				_ = cc[c].wgConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+				buf := make([]byte, 65535)
+				n, _, err := cc[c].wgConn.ReadFromUDP(buf)
+				if err != nil {
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						if time.Now().After(deadline) {
+							t.Fatalf("client %d wg did not receive expected msg from remote %d", c, i)
+						}
+						continue
+					}
+					t.Fatalf("client %d wg read error: %v", c, err)
+				}
+				got := append([]byte(nil), buf[:n]...)
+				if equalBytes(got, msg) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("client %d wg did not receive expected msg from remote %d", c, i)
+				}
+			}
+		}()
+	}
+
+	// wg -> remote
+	for i := 0; i < N; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			msg := []byte("pong-" + strconvIt(i))
+			r := clientToRemote[i]
+			if r < 0 || r >= N {
+				t.Fatalf("invalid mapping for client %d -> remote %d", i, r)
+			}
+			if cc[i].clientSockSeen == nil {
+				t.Fatalf("client %d missing clientSockSeen", i)
+			}
+			if _, err := cc[i].wgConn.WriteToUDP(msg, cc[i].clientSockSeen); err != nil {
+				t.Fatalf("client %d wg write: %v", i, err)
+			}
+			// Read until expected msg (interleaving possible)
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				_ = remotes[r].conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+				buf := make([]byte, 65535)
+				n, _, err := remotes[r].conn.ReadFromUDP(buf)
+				if err != nil {
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						if time.Now().After(deadline) {
+							t.Fatalf("remote %d did not receive expected msg from client %d", r, i)
+						}
+						continue
+					}
+					t.Fatalf("remote %d read error: %v", r, err)
+				}
+				got := append([]byte(nil), buf[:n]...)
+				if equalBytes(got, msg) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("remote %d did not receive expected msg from client %d", r, i)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Cleanup clients and server
+	for i := 0; i < N; i++ {
+		cc[i].cancel()
+		select {
+		case <-cc[i].done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("client %d did not exit in time", i)
+		}
+		cc[i].wgConn.Close()
+	}
+
+	cancel()
+	select {
+	case <-doneSrv:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("server did not exit in time")
+	}
+
+	// Close remotes
+	for _, r := range remotes {
+		_ = r.conn.Close()
+	}
 }
