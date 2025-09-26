@@ -20,7 +20,7 @@ standby:
 - if something other than "handshake reply", i.e. wireguard handshake, is received from the server address, go to "active state"
 
 active:
-- relays data between two known addr-ports.
+- relays data between two known addr-ports. i.e. if the packet is from A send to B, if it's from B send to A.
 - if the connection is idle for some time, close it.
 - no active keepalive by frpc/frps because wireguard will do it.
 - use golang listener to track liveness, but
