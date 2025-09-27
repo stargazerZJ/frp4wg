@@ -10,6 +10,8 @@ Goals:
 
 Status: MVP implemented in a single binary with client/server subcommands, using Go's standard library and slog. nft offload is not included yet; code leaves clear extension points for future integration.
 
+**Human** Comment on Project Status: It's neither performant nor elegant, but it's usable for now.
+
 ## Build
 
 Requires Go toolchain compatible with the module directive in [go.mod](go.mod). Then:
