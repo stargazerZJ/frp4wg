@@ -311,7 +311,6 @@ func (s *clientStandby) run() {
 
 	logger := s.logger
 
-	missed := 0
 	interval := s.m.cfg.HandshakeInterval
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -320,39 +319,41 @@ func (s *clientStandby) run() {
 	if hsTries <= 0 {
 		hsTries = 3
 	}
+	lives := hsTries
 
 	buf := make([]byte, s.m.cfg.ReadBufferSize)
 	if len(buf) == 0 {
 		buf = make([]byte, 65535)
 	}
 
+	_, err := s.conn.WriteToUDP(magicBytes, s.m.serverAddr)
+	lives -= 1
+	_ = s.conn.SetReadDeadline(time.Now().Add(interval))
+	if err != nil {
+		logger.Warn("handshake write failed", "err", err)
+		return
+	}
+
 	for {
-		// periodically send handshake
-		_, err := s.conn.WriteToUDP(magicBytes, s.m.serverAddr)
-		if err != nil {
-			logger.Warn("handshake write failed", "err", err)
-			return
-		}
-
-		// wait for reply or activation
-		deadline := time.Now().Add(interval)
-		_ = s.conn.SetReadDeadline(deadline)
-
 		n, from, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				missed++
-				if missed >= hsTries {
-					logger.Info("no handshake reply, recreate")
+				_, err := s.conn.WriteToUDP(magicBytes, s.m.serverAddr)
+				lives -= 1
+				_ = s.conn.SetReadDeadline(time.Now().Add(interval))
+				if err != nil {
+					logger.Warn("handshake write failed", "err", err)
 					return
 				}
-				time.Sleep(100 * time.Millisecond)
+				if lives < 0 {
+					logger.Info("no handshake reply after ", hsTries, "tries , recreate")
+					return
+				}
 				continue
 			}
 			logger.Warn("standby read error", "err", err)
 			return
 		}
-		missed = 0
 
 		if !from.IP.Equal(s.m.serverAddr.IP) || from.Port != s.m.serverAddr.Port {
 			// ignore unexpected source
@@ -362,13 +363,7 @@ func (s *clientStandby) run() {
 		data := buf[:n]
 		if isHandshake(data) {
 			logger.Debug("handshake reply ok")
-			// stay standby, sleep until next interval
-			left := time.Until(deadline)
-			if left > 0 {
-				time.Sleep(left)
-			} else {
-				time.Sleep(50 * time.Millisecond)
-			}
+			lives += 1
 			continue
 		}
 
