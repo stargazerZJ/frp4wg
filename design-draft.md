@@ -5,6 +5,7 @@ frp4wg a minimal frp-like application that aims to forward one single wireguard 
 2. zero datagram size overhead so that wireguard MTU do not decrease.
 3. 0-RTT new connection establishment after initial frpc-frps handshake
 4. only a small known number of clients will connect to wireguard.
+5. on the frpc machine the wireguard 'server' is run, and multiple wireguard 'client's will connect to the frps port from different addresses.
 
 This is my design:
 
@@ -36,7 +37,7 @@ frps:
 
 Listen on one single port only.
 
-When a new addr-port connects to the port, and the datagram is a "handshake", start a new standby connection. If the data is not handshake, consume a standby connection FIFO. if there is none, drop.
+When a new addr-port connects to the port, and the datagram is a "handshake", start a new standby connection. If the data is not handshake, consume the standby connection that sends the most recent handshake. if there is none, drop.
 
 standby:
 - respond to handshake
@@ -48,6 +49,11 @@ active:
 
 data scheme:
 both handshake and handshake reply message is "frp4wg" 6-byte sequence.
+
+parameters and defaults:
+frpc: 12s handshake period, 1 handshake failure results in standby connection close, 2 standby connections. up to 8 active connections
+frps: track up to 4 standby connections.
+both: up to 8 active connections. 60s active connection idle timeout.
 
 To avoid exe name conflict, do not use frpc nor frps. call it 'frp4wg'. usage is `frp4wg c[lient]` or `frp4wg s[erver]`.
 
