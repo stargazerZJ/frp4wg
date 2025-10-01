@@ -346,7 +346,7 @@ func (s *clientStandby) run() {
 					return
 				}
 				if lives < 0 {
-					logger.Info("no handshake reply after ", hsTries, "tries , recreate")
+					logger.Info(fmt.Sprintf("no handshake reply after %s tries , recreate", hsTries))
 					return
 				}
 				continue
