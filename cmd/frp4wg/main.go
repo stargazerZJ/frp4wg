@@ -77,13 +77,13 @@ func main() {
 		_ = fs.Parse(os.Args[2:])
 
 		cfg := serverConfig{
-			Bind:             *bind,
-			StandbyTTL:       *standbyTTL,
-			ActiveIdle:       *activeIdle,
-			MaxStandby:       *maxStandby,
-			GCInterval:       *gcEvery,
-			ReadBufferSize:   *readBuf,
-			Logger:           logger,
+			Bind:           *bind,
+			StandbyTTL:     *standbyTTL,
+			ActiveIdle:     *activeIdle,
+			MaxStandby:     *maxStandby,
+			GCInterval:     *gcEvery,
+			ReadBufferSize: *readBuf,
+			Logger:         logger,
 		}
 		if err := runServer(cfg); err != nil {
 			slog.Error("server exited with error", "err", err)
@@ -384,9 +384,9 @@ func (s *clientStandby) run() {
 
 type clientActive struct {
 	m           *clientManager
-	conn        *net.UDPConn  // socket toward server (keeps NAT mapping)
-	serverAddr  *net.UDPAddr  // server endpoint
-	localWGAddr *net.UDPAddr  // local WireGuard endpoint
+	conn        *net.UDPConn // socket toward server (keeps NAT mapping)
+	serverAddr  *net.UDPAddr // server endpoint
+	localWGAddr *net.UDPAddr // local WireGuard endpoint
 	logger      *slog.Logger
 	idle        time.Duration
 	bufSize     int
@@ -499,21 +499,21 @@ type standbyEntry struct {
 }
 
 type serverState struct {
-	cfg   serverConfig
-	conn  *net.UDPConn
-	ctx   context.Context
+	cfg    serverConfig
+	conn   *net.UDPConn
+	ctx    context.Context
 	cancel context.CancelFunc
-	wg    sync.WaitGroup
+	wg     sync.WaitGroup
 
 	// standby management
 	standbyMu sync.Mutex
-	standbyQ  []*standbyEntry       // FIFO
+	standbyQ  []*standbyEntry // FIFO
 	standbyIx map[string]*standbyEntry
 
 	// active mappings
-	activeMu        sync.RWMutex
-	activeByClient  map[string]*activePair
-	activeByRemote  map[string]*activePair
+	activeMu       sync.RWMutex
+	activeByClient map[string]*activePair
+	activeByRemote map[string]*activePair
 }
 
 func runServer(cfg serverConfig) error {
