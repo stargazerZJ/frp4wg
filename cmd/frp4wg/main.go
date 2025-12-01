@@ -346,7 +346,7 @@ func (s *clientStandby) run() {
 					return
 				}
 				if lives < 0 {
-					logger.Info(fmt.Sprintf("no handshake reply after %s tries , recreate", hsTries))
+					logger.Info(fmt.Sprintf("no handshake reply after %d tries, recreate", hsTries))
 					return
 				}
 				continue
@@ -680,8 +680,10 @@ func (s *serverState) popStandby() *net.UDPAddr {
 	if len(s.standbyQ) == 0 {
 		return nil
 	}
-	e := s.standbyQ[0]
-	s.standbyQ = s.standbyQ[1:]
+	// Use the most recent handshake (LIFO - pop from back)
+	last := len(s.standbyQ) - 1
+	e := s.standbyQ[last]
+	s.standbyQ = s.standbyQ[:last]
 	delete(s.standbyIx, addrKey(e.addr))
 	return e.addr
 }
