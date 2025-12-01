@@ -55,7 +55,31 @@ frpc: 12s handshake period, 1 handshake failure results in standby connection cl
 frps: track up to 4 standby connections.
 both: up to 8 active connections. 60s active connection idle timeout.
 
+fs := flag.NewFlagSet("client", flag.ExitOnError)
+server := fs.String("server", "", "frps UDP address (host:port)")
+local := fs.String("local", "127.0.0.1:51820", "local WireGuard UDP address to forward to")
+standbyN := fs.Int("standby", 8, "number of standby connections to maintain")
+hsInterval := fs.Duration("handshake-interval", 5*time.Second, "interval between client handshakes")
+hsTries := fs.Int("handshake-tries", 3, "max consecutive missed handshake replies before recreating standby")
+activeIdle := fs.Duration("active-timeout", 2*time.Minute, "idle timeout for active connection")
+readBuf := fs.Int("read-buffer", 65535, "read buffer size in bytes")
+
+fs := flag.NewFlagSet("server", flag.ExitOnError)
+bind := fs.String("bind", ":51820", "bind UDP address for frps (and WireGuard public port)")
+standbyTTL := fs.Duration("standby-ttl", 30*time.Second, "expire standby if no handshake within this duration")
+activeIdle := fs.Duration("active-timeout", 2*time.Minute, "idle timeout for active mapping")
+maxStandby := fs.Int("max-standby", 128, "max standby entries to keep (FIFO)")
+gcEvery := fs.Duration("gc-interval", 5*time.Second, "background GC check interval")
+readBuf := fs.Int("read-buffer", 65535, "read buffer size in bytes")
+_ = fs.Parse(os.Args[2:])
+
 To avoid exe name conflict, do not use frpc nor frps. call it 'frp4wg'. usage is `frp4wg c[lient]` or `frp4wg s[erver]`.
 
-Implementation note:
-use the latest slog package.
+
+testing and benchmarking:
+
+1) iperf3 -s
+2) ./frp4wg s -bind :50000
+3) ./frp4wg c -server localhost:50000 -local 127.0.0.1:5201
+4) socat TCP4-LISTEN:50000,fork,reuseaddr TCP4:127.0.0.1:5201
+5) iperf3 -c 127.0.0.1 -p 50000 -u -b <BW>
